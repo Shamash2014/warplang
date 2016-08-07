@@ -1,4 +1,5 @@
 require 'byebug'
+require 'forwardable'
 module Warp
   class STDInport
     TOKENIZER = /\s*(,@|[('`,)]|"(?:[\\].|[^\\"])*"|;.*|[^\s('"`,;)]*)(.*)/
@@ -300,39 +301,17 @@ end
 
 module Warp
   class EnvTable
-    attr_reader :global
-    def initialize(env = {})
-      @global = env
-      @additional = []
+    extend Forwardable
+    attr_accessor :main, :outer
+    def initialize(args =[], params =[], outer=nil)
+      @main = args.zip(params).to_h
+      @outer = outer
     end
+    def_delegators :@main, :[], :[]=
 
-    def exists?(env, var_ref)
-      env.global.fetch(var_ref, nil)
-    end
-
-    def find(var_ref)
-      if exists?(self, var_ref)
-        @global[var_ref]
-      else
-        found = @additional.find do |env|
-          self.exists?(env, var_ref)
-        end
-
-        if found
-          found.find(var_ref)
-        else
-          raise 'Cannot found var in ENV: ' + var_ref.to_s
-        end
-      end
-    end
-
-    def add_frame(env)
-      @additional << self.class.new(env)
-      self
-    end
-
-    def add_var(var, val)
-      @global[var] = val
+    def find(var)
+      return @main[var] if @main.has_key?(var)
+      @outer&.find(var)
     end
   end
 end
@@ -377,9 +356,35 @@ def char?(input)
   input.class == Warp::Model::Char
 end
 
-ENV = Warp::EnvTable.new({
+module Warp
+  module Model
+    class Function
+      def initialize(params, expr, env)
+        @params = params
+        @expr = expr
+        @env = env
+      end
+
+      def quoted?
+        false
+      end
+
+      def to_s
+        'function'
+      end
+
+      def call(*args)
+        evaluate(@expr, Warp::EnvTable.new(@params, args, @env))
+      end
+    end
+  end
+end
+
+ENV = Warp::EnvTable.new.tap do |ev|
+
+                       ev.main.merge!({
                            '#:n' => -> () { puts },
-                           '#:g' => -> () { puts ENV.global },
+                           '#:g' => -> () { puts ENV.main },
                            :+ => ->(*args) do
                              if args.find { |u| u.is_a?(Warp::Model::Double) }
                                Warp::Model::Double.new(args.map(&:val).reduce(:+))
@@ -512,44 +517,59 @@ ENV = Warp::EnvTable.new({
                              Warp::Model::List.new args
                            }
                            })
-def evaluate(input)
+end
+
+def evaluate(input, env = ENV)
   if input.quoted? && !char?(input)
     input
   elsif char?(input) && input.quoted?
-    ENV.find(input.val).call
+    env.find(input.val).call
   elsif symbol?(input)
-    ENV.find(input.val)
+    env.find(input.val)
   elsif list?(input) && symbol?(input.car)
     if input.car.val == :quote
-      input.cdr
+      input.cdr.first
     elsif input.car.val == :bind
       cdr = input.val[1]
       var = if cdr.is_a?(Warp::Model::List)
-              evaluate(cdr).val
+              evaluate(cdr, env).val
             else
               cdr.val
             end
 
-      if ENV.exists?(ENV, var)
+      if env.find(var)
         raise 'Var already bound'
       else
-        ENV.add_var(var, evaluate(input.val[2]))
+        env[var] = evaluate(input.val[2], env)
       end
-      ENV.find(var)
+      env.find(var)
     elsif input.car.val == :if
       _, test, success, error = input.val
-      if evaluate(test).bool == 'true'
-        evaluate(success)
+      if evaluate(test, env).bool == 'true'
+        evaluate(success, env)
       else
-        evaluate(error)
+        evaluate(error, env)
       end
+    elsif input.car.val == :fn
+      params, body = input.cdr
+      Warp::Model::Function.new(params.val.map(&:val), body, env)
+    elsif input.car.val == :do
+      input.cdr.map do |exp|
+        evaluate(exp, env)
+      end.last
     else
-      proc = ENV.find(input.car.val)
+      proc = env.find(input.car.val)
       args = input.val.slice(1..-1)
-      proc.(*args.map{ |arg| evaluate(arg) })
+      proc.(*args.map{ |arg| evaluate(arg, env) })
     end
   else
-    raise 'Cannot evaluate unknown expression: ' + input.to_s
+    if evaluate(input.car, env).is_a?(Warp::Model::Function)
+      proc = evaluate(input.car, env)
+      args = input.val.slice(1..-1)
+      return proc.(*args.map{ |arg| evaluate(arg, env) })
+    else
+      raise 'Cannot evaluate unknown expression: ' + input.to_s
+    end
   end
 end
 
@@ -566,7 +586,7 @@ def repl(args={})
   stty_save = %x`stty -g`.chomp
   trap("INT") { system "stty", stty_save; exit }
 
-  puts 'W.A.R.P Lang, version 0.0.12'
+  puts 'W.A.R.P Lang, version 0.0.13'
   puts 'Starting...'
   puts
   while buff = Readline.readline("::> ", true)
