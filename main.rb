@@ -1,5 +1,6 @@
 require 'byebug'
 require 'forwardable'
+
 module Warp
   class STDInport
     TOKENIZER = /\s*(,@|[('`,)]|"(?:[\\].|[^\\"])*"|;.*|[^\s('"`,;)]*)(.*)/
@@ -16,6 +17,7 @@ module Warp
       end
       @type = kwargs[:type] || 'string'
     end
+
 
     def next_token
       if @line == ''
@@ -40,7 +42,7 @@ module Warp
   end
 end
 
-QUOTES = { "'" => 'quote' }
+QUOTES = { "'" => 'quote', "`" => 'quasiquote', "," => "unquote", ",@" => "unquoteSplicing" }
 def read_ahead(inport, input)
   if input == '('
     list = []
@@ -263,6 +265,17 @@ module Warp
         end
       end
 
+      def size
+        @val.size
+      end
+
+      def map(&block)
+        self.class.new(@val.reduce([]) do |acc, x|
+          acc << block.call(x)
+          acc
+        end)
+      end
+
       def to_s
         case @val
         when []
@@ -288,8 +301,16 @@ module Warp
         @val.first
       end
 
+      def carvl
+        @val.first.val
+      end
+
       def cdr
         @val.slice(1..-1)
+      end
+
+      def cdr=list
+        self.class.new([@val.first, list.val])
       end
 
       def quoted?
@@ -519,8 +540,88 @@ ENV = Warp::EnvTable.new.tap do |ev|
                            })
 end
 
+MACRO_TABLE = {}
+
+def expand(input, env = ENV)
+  if !list?(input)
+    input
+  elsif list?(input) && input.carvl == :quote
+    raise 'Syntax error, quote must have proceeding expression' if input.size < 2
+    input
+  elsif list?(input) && input.carvl == :if
+    raise 'Syntax error, if must have success and error case' if input.size < 3
+    symb, pred, succ, err = input.val
+    Warp::Model::List.new(
+      [
+        symb,
+        expand(pred),
+        expand(succ),
+        expand(err)
+      ]
+    )
+  elsif list?(input) && input.carvl == :bind
+    raise 'Syntax error, bind must have symbol expression supplied' if input.size < 3
+    symb, sym, expr = input.val
+    Warp::Model::List.new([
+                            symb,
+                            sym,
+                            expand(expr)
+                          ])
+  elsif list?(input) && input.carvl == :fn
+    sym, vars, body = input.val
+    raise 'Syntax error, fn expected at least 3 expressions' unless input.size >= 3
+    raise 'Syntax error, illegal lambda arguments list' if !vars.val.all? { |x| x.class == Warp::Model::Symbol }
+    Warp::Model::List.new([
+                            sym,
+                            vars,
+                            expand(body)
+                          ])
+  elsif list?(input) && input.carvl == :defmacro
+    proc = evaluate(expand(input.val[2]))
+    name = input.val[1]
+    MACRO_TABLE[name.val] = proc
+    nil
+  elsif list?(input) && [:quasiquote, :unquote, :unquoteSplicing].include?(input.carvl)
+    expand_quote(*input.cdr)
+  elsif list?(input) && symbol?(input.car) && MACRO_TABLE.has_key?(input.car.val)
+    expand(MACRO_TABLE[input.car.val].call(*input.cdr))
+  else
+    p MACRO_TABLE.has_key?(input.car.val)
+
+    input.map do |val|
+      expand(val)
+    end
+  end
+end
+
+def expand_quote(x)
+  if !list?(x)
+    p x
+    Warp::Model::List.new([
+                            Warp::Model::Symbol.new('quote'),
+                            x
+                          ])
+  elsif x.carvl == :unquote
+    x.cdr.first
+  elsif x.carvl == :unquoteSplicing
+
+    Warp::Model::List.new([
+                            x.cdr.first,
+                            expand_quote(x.cdr.slice(1..-1))
+                          ])
+  else
+    Warp::Model::List.new([
+                            Warp::Model::Symbol.new(:cons),
+                            expand_quote(x.car),
+                            expand_quote(x.cdr)
+                          ])
+  end
+end
+
 def evaluate(input, env = ENV)
-  if input.quoted? && !char?(input)
+  if input.nil?
+    print
+  elsif input.quoted? && !char?(input)
     input
   elsif char?(input) && input.quoted?
     env.find(input.val).call
@@ -593,7 +694,7 @@ def repl(args={})
 
     # p Readline::HISTORY.to_a
     begin
-      puts write(evaluate(read(buff)))
+      puts write(evaluate(expand(read(buff))))
     rescue => e
       p "Runtime Error: " + e.message
     end
