@@ -306,7 +306,12 @@ module Warp
       end
 
       def cdr
-        @val.slice(1..-1)
+        val = @val.slice(1..-1)
+        if val.nil?
+          []
+        else
+          val
+        end
       end
 
       def cdr=list
@@ -375,6 +380,10 @@ end
 
 def char?(input)
   input.class == Warp::Model::Char
+end
+
+def pair?(input)
+  input.class == Warp::Model::List && input.val.size > 1
 end
 
 module Warp
@@ -536,7 +545,10 @@ ENV = Warp::EnvTable.new.tap do |ev|
                            },
                           :list => -> (*args) {
                              Warp::Model::List.new args
-                           }
+                                        },
+                          :join => ->(coll, *el) {
+                               Warp::Model::List.new [coll.val].concat([el])
+                                        },
                            })
 end
 
@@ -581,7 +593,7 @@ def expand(input, env = ENV)
     name = input.val[1]
     MACRO_TABLE[name.val] = proc
     nil
-  elsif list?(input) && [:quasiquote, :unquote, :unquoteSplicing].include?(input.carvl)
+  elsif list?(input) && :quasiquote == input.carvl
     expand_quote(*input.cdr)
   elsif list?(input) && symbol?(input.car) && MACRO_TABLE.has_key?(input.car.val)
     expand(MACRO_TABLE[input.car.val].call(*input.cdr))
@@ -595,25 +607,27 @@ def expand(input, env = ENV)
 end
 
 def expand_quote(x)
-  if !list?(x)
-    p x
+  if x.nil?
+    Warp::Model::List.new []
+  elsif x.class != Warp::Model::List
     Warp::Model::List.new([
                             Warp::Model::Symbol.new('quote'),
                             x
                           ])
-  elsif x.carvl == :unquote
-    x.cdr.first
-  elsif x.carvl == :unquoteSplicing
-
+  elsif x&.carvl == :unquote
+    x.cdr
+  elsif x&.carvl == :unquoteSplicing
+    p 'Splicing'
     Warp::Model::List.new([
-                            x.cdr.first,
-                            expand_quote(x.cdr.slice(1..-1))
+                            Warp::Model::Symbol.new(:push),
+                            expand_quote(x.cdr.first),
+                            expand(x.cdr.slice(1..-1))
                           ])
   else
     Warp::Model::List.new([
-                            Warp::Model::Symbol.new(:cons),
-                            expand_quote(x.car),
-                            expand_quote(x.cdr)
+                            Warp::Model::Symbol.new(:join),
+                            x.car,
+                            x.cdr.map { |y| expand_quote(y) }
                           ])
   end
 end
